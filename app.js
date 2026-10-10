@@ -14,6 +14,10 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "UP" });
 });
 
+app.get("/ci-cd", (req, res) => {
+  res.status(200).json({ status: "Application Deloyed through CI/CD Successfully" });
+});
+
 if (require.main === module) {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Application listening on port ${PORT}`);
