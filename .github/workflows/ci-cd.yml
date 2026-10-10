@@ -1,5 +1,5 @@
 
-name: CI Pipeline
+name: CI-CD Pipeline
 
 on:
   push:
@@ -37,4 +37,42 @@ jobs:
         run: npm test
 
       - name: Build Docker image
-        run: docker build -t github-actions-cicd-demo:${{ github.sha }} .
+        run: docker build -t cicd-demo:${{ github.sha }} .
+
+  publish-image:
+    name: Publish Docker Image to GHCR
+    runs-on: ubuntu-latest
+
+    needs: test-and-build
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Normalize image name
+        shell: bash
+        run: |
+          IMAGE_NAME="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_NAME=$IMAGE_NAME" >> "$GITHUB_ENV"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
