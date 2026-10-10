@@ -77,57 +77,238 @@ jobs:
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
   
+  
   deploy-to-render:
-    name: Deploy to Render
+    name: Deploy, Verify, and Roll Back
     runs-on: ubuntu-latest
-
     needs: publish-image
 
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      RENDER_SERVICE_ID: ${{ vars.RENDER_SERVICE_ID }}
+      APP_URL: ${{ vars.RENDER_SERVICE_URL }}
+
     steps:
-      - name: Trigger Render deployment
-        env:
-          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      - name: Deploy and verify application
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
+          : "${RENDER_API_KEY:?Missing RENDER_API_KEY secret}"
+          : "${RENDER_SERVICE_ID:?Missing RENDER_SERVICE_ID variable}"
+          : "${APP_URL:?Missing RENDER_SERVICE_URL variable}"
+
+          API_BASE="https://api.render.com/v1"
           IMAGE_NAME="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           IMAGE_URL="${IMAGE_NAME}:sha-${GITHUB_SHA}"
 
-          echo "Requesting deployment of the commit-specific image."
+          api_get() {
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer ${RENDER_API_KEY}" \
+              --header "Accept: application/json" \
+              "$1"
+          }
 
-          curl --fail --silent --show-error --get \
-            --data-urlencode "imgURL=${IMAGE_URL}" \
-            "$RENDER_DEPLOY_HOOK_URL"
+          api_post() {
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer ${RENDER_API_KEY}" \
+              --header "Accept: application/json" \
+              --header "Content-Type: application/json" \
+              --data "$2" \
+              "$1"
+          }
 
-          echo "Render accepted the deployment request."
+          health_check() {
+            echo "Checking application health..."
 
-      - name: Verify application health endpoint
-        env:
-          APP_URL: ${{ vars.RENDER_SERVICE_URL }}
-        shell: bash
-        run: |
-          set -euo pipefail
+            for attempt in $(seq 1 12); do
+              RESPONSE="$(curl --fail --silent --show-error \
+                --max-time 10 \
+                "${APP_URL%/}/health" 2>/dev/null || true)"
 
-          if [ -z "$APP_URL" ]; then
-            echo "RENDER_SERVICE_URL is not configured."
+              if printf '%s' "$RESPONSE" |
+                jq -e '.status == "UP"' >/dev/null 2>&1; then
+                echo "Application health check passed."
+                return 0
+              fi
+
+              echo "Health check attempt ${attempt}/12 failed."
+              sleep 10
+            done
+
+            echo "Application health check failed."
+            return 1
+          }
+
+          wait_for_deploy() {
+            local deploy_id="$1"
+            local status="unknown"
+
+            echo "Waiting for Render deployment: ${deploy_id}"
+
+            for attempt in $(seq 1 40); do
+              local response
+
+              if ! response="$(api_get \
+                "${API_BASE}/services/${RENDER_SERVICE_ID}/deploys/${deploy_id}")"; then
+                echo "Could not retrieve deployment status."
+                return 1
+              fi
+
+              status="$(printf '%s' "$response" |
+                jq -r '.status // "unknown"')"
+
+              echo "Deployment status: ${status} (${attempt}/40)"
+
+              if [ "$status" = "live" ]; then
+                echo "Render reports the deployment is live."
+                return 0
+              fi
+
+              case "$status" in
+                build_failed|update_failed|canceled|pre_deploy_failed)
+                  echo "Deployment reached a failed terminal state."
+                  return 1
+                  ;;
+              esac
+
+              sleep 15
+            done
+
+            echo "Timed out waiting for deployment completion."
+            return 1
+          }
+
+          rollback_previous() {
+            if [ -z "${PREVIOUS_DEPLOY_ID:-}" ]; then
+              echo "No previous live deployment was found."
+              echo "Automatic rollback is unavailable."
+              return 1
+            fi
+
+            echo "Rolling back to previous deployment: ${PREVIOUS_DEPLOY_ID}"
+
+            local rollback_response
+            local rollback_id
+
+            if ! rollback_response="$(api_post \
+              "${API_BASE}/services/${RENDER_SERVICE_ID}/rollback" \
+              "$(jq -n --arg deployId "$PREVIOUS_DEPLOY_ID" \
+                '{deployId: $deployId}')")"; then
+              echo "Render rejected the rollback request."
+              return 1
+            fi
+
+            rollback_id="$(printf '%s' "$rollback_response" |
+              jq -r '.id // empty')"
+
+            if [ -z "$rollback_id" ]; then
+              echo "Rollback was requested, but no rollback ID was returned."
+              return 1
+            fi
+
+            if ! wait_for_deploy "$rollback_id"; then
+              echo "Rollback deployment did not become live."
+              return 1
+            fi
+
+            if ! health_check; then
+              echo "Rollback completed, but health verification failed."
+              return 1
+            fi
+
+            echo "Rollback completed and the application is healthy."
+            return 0
+          }
+
+          echo "Looking up the current live deployment..."
+
+          DEPLOYS="$(api_get \
+            "${API_BASE}/services/${RENDER_SERVICE_ID}/deploys?limit=20")"
+
+          PREVIOUS_DEPLOY_ID="$(printf '%s' "$DEPLOYS" |
+            jq -r '
+              [.[] | .deploy |
+                select(.status == "live" and .id != null)]
+              | sort_by(.createdAt)
+              | if length > 0 then .[-1].id else empty end
+            ')"
+
+          if [ -z "$PREVIOUS_DEPLOY_ID" ]; then
+            echo "Warning: no current live deployment was found."
+            echo "The first deployment cannot automatically roll back."
+          else
+            echo "Previous live deployment recorded."
+          fi
+
+          echo "Requesting deployment of the new image."
+
+          DEPLOY_RESPONSE="$(api_post \
+            "${API_BASE}/services/${RENDER_SERVICE_ID}/deploys" \
+            "$(jq -n --arg imageUrl "$IMAGE_URL" \
+              '{imageUrl: $imageUrl}')")"
+
+          DEPLOY_ID="$(printf '%s' "$DEPLOY_RESPONSE" |
+            jq -r '.id // .deploy.id // empty')"
+
+          # If Render queued the request without returning an ID,
+          # look for the deployment by its unique commit-specific image.
+          if [ -z "$DEPLOY_ID" ]; then
+            for attempt in $(seq 1 12); do
+              DEPLOYS="$(api_get \
+                "${API_BASE}/services/${RENDER_SERVICE_ID}/deploys?limit=20")"
+
+              DEPLOY_ID="$(printf '%s' "$DEPLOYS" |
+                jq -r --arg image "$IMAGE_URL" '
+                  [.[] | .deploy |
+                    select(.image.ref == $image and .id != null)]
+                  | sort_by(.createdAt)
+                  | if length > 0 then .[-1].id else empty end
+                ')"
+
+              if [ -n "$DEPLOY_ID" ]; then
+                break
+              fi
+
+              sleep 5
+            done
+          fi
+
+          if [ -z "$DEPLOY_ID" ]; then
+            echo "Could not identify the requested deployment."
+            echo "Check the Render Deploys page before retrying."
             exit 1
           fi
 
-          for attempt in $(seq 1 20); do
-            if curl --fail --silent --show-error \
-              --max-time 10 \
-              "${APP_URL%/}/health"; then
-              echo
-              echo "Health endpoint responded successfully."
-              exit 0
+          echo "Render deployment ID received."
+
+          if ! wait_for_deploy "$DEPLOY_ID"; then
+            echo "New deployment failed or timed out."
+
+            if rollback_previous; then
+              echo "Previous version restored."
+            else
+              echo "Automatic rollback did not complete successfully."
+              echo "Inspect Render's Deploys page and service logs."
             fi
 
-            echo "Health check attempt $attempt failed; retrying in 15 seconds."
-            sleep 15
-          done
+            exit 1
+          fi
 
-          echo "Application health check failed."
-          exit 1
+          if ! health_check; then
+            echo "Deployment is live, but health verification failed."
+
+            if rollback_previous; then
+              echo "Previous version restored."
+            else
+              echo "Automatic rollback did not complete successfully."
+              echo "Inspect Render's Deploys page and service logs."
+            fi
+
+            exit 1
+          fi
+
+          echo "Deployment succeeded and health verification passed."
