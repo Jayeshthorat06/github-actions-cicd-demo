@@ -76,3 +76,58 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+  
+  deploy-to-render:
+    name: Deploy to Render
+    runs-on: ubuntu-latest
+
+    needs: publish-image
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Trigger Render deployment
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_NAME="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_URL="${IMAGE_NAME}:sha-${GITHUB_SHA}"
+
+          echo "Requesting deployment of the commit-specific image."
+
+          curl --fail --silent --show-error --get \
+            --data-urlencode "imgURL=${IMAGE_URL}" \
+            "$RENDER_DEPLOY_HOOK_URL"
+
+          echo "Render accepted the deployment request."
+
+      - name: Verify application health endpoint
+        env:
+          APP_URL: ${{ vars.RENDER_SERVICE_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$APP_URL" ]; then
+            echo "RENDER_SERVICE_URL is not configured."
+            exit 1
+          fi
+
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --show-error \
+              --max-time 10 \
+              "${APP_URL%/}/health"; then
+              echo
+              echo "Health endpoint responded successfully."
+              exit 0
+            fi
+
+            echo "Health check attempt $attempt failed; retrying in 15 seconds."
+            sleep 15
+          done
+
+          echo "Application health check failed."
+          exit 1
