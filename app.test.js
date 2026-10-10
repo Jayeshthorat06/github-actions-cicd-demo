@@ -15,7 +15,7 @@ test("GET / returns the application message", async (t) => {
   const body = await response.json();
 
   assert.equal(response.status, 200);
-  assert.equal(body.message, "CI/CD pipeline is failed!");
+  assert.equal(body.message, "CI/CD pipeline is running!");
 });
 
 test("GET /health returns UP", async (t) => {
